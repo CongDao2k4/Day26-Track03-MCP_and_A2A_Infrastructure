@@ -10,6 +10,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
@@ -81,7 +83,43 @@ LEGAL_KNOWLEDGE = [
             "public interest (Winter v. Natural Resources Defense Council, 2008)."
         ),
     },
+    {
+        "id": "labor_law",
+        "keywords": ["lao động", "sa thải", "hợp đồng lao động", "labor", "termination"],
+        "text": (
+            "Theo Bộ luật Lao động Việt Nam 2019, người sử dụng lao động có thể "
+            "đơn phương chấm dứt hợp đồng trong các trường hợp: (1) người lao động "
+            "thường xuyên không hoàn thành công việc; (2) bị ốm đau, tai nạn đã điều trị "
+            "12 tháng chưa khỏi; (3) thiên tai, hỏa hoạn; (4) người lao động đủ tuổi nghỉ hưu."
+        ),
+    }
 ]
+
+
+async def invoke_with_retry(runnable, messages, attempts: int = 2, timeout_seconds: int = 30):
+    """Call the LLM with a small retry for transient provider errors."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(runnable.ainvoke(messages), timeout=timeout_seconds)
+        except Exception as exc:
+            last_error = exc
+            print(f"  LLM call failed on attempt {attempt}/{attempts}: {exc}")
+            if attempt < attempts:
+                await asyncio.sleep(1)
+    raise last_error
+
+
+def fallback_answer(question: str) -> str:
+    """Deterministic fallback so the demo still runs when the LLM provider returns 500."""
+    retrieved = search_legal_database.invoke({"query": question})
+    return (
+        "[Fallback: LLM provider failed, using tool result directly]\n\n"
+        f"{retrieved}\n\n"
+        "Kết luận ngắn: Người sử dụng lao động không thể sa thải tùy tiện. "
+        "Việc chấm dứt hợp đồng/sa thải phải có căn cứ hợp pháp, đúng trình tự, "
+        "và phụ thuộc vào tình huống cụ thể của người lao động."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +129,13 @@ LEGAL_KNOWLEDGE = [
 @tool
 def search_legal_database(query: str) -> str:
     """Search the legal knowledge base for relevant statutes, case law, and legal principles."""
+    query_lower = query.lower()
     query_words = set(query.lower().split())
     scored = []
     for entry in LEGAL_KNOWLEDGE:
-        overlap = len(query_words & set(entry["keywords"]))
+        phrase_matches = sum(1 for keyword in entry["keywords"] if keyword.lower() in query_lower)
+        token_overlap = len(query_words & {keyword.lower() for keyword in entry["keywords"]})
+        overlap = phrase_matches + token_overlap
         if overlap > 0:
             scored.append((overlap, entry))
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -135,9 +176,32 @@ def calculate_damages(breach_type: str, contract_value: float) -> str:
     )
 
 
-TOOLS = [search_legal_database, calculate_damages]
+@tool
+def check_statute_of_limitations(case_type: str) -> str:
+    """Kiểm tra thời hiệu khởi kiện theo loại vụ án.
+    
+    Args:
+        case_type: Loại vụ án (contract, tort, property)
+    """
+    normalized = case_type.lower()
+    if "hợp đồng" in normalized or "contract" in normalized:
+        normalized = "contract"
+    elif "bồi thường" in normalized or "tort" in normalized:
+        normalized = "tort"
+    elif "tài sản" in normalized or "property" in normalized:
+        normalized = "property"
 
-QUESTION = "What are the legal consequences if a company breaches a non-disclosure agreement?"
+    limits = {
+        "contract": "4 năm (UCC § 2-725)",
+        "tort": "2-3 năm tùy bang",
+        "property": "5 năm",
+    }
+    return limits.get(normalized, "Không xác định")
+
+
+TOOLS = [search_legal_database, calculate_damages, check_statute_of_limitations]
+
+QUESTION = "Người sử dụng lao động có thể sa thải nhân viên không?"
 
 
 async def main():
@@ -146,7 +210,7 @@ async def main():
     print("=" * 70)
     print()
     print("[How it works]")
-    print("  1. LLM receives tools (search_legal_database, calculate_damages)")
+    print("  1. LLM receives tools (search_legal_database, calculate_damages, check_statute_of_limitations)")
     print("  2. LLM decides which tools to call and with what arguments")
     print("  3. We execute the tools and feed results back to the LLM")
     print("  4. LLM generates a final answer grounded in retrieved data")
@@ -172,7 +236,12 @@ async def main():
 
     # --- Step 1: LLM decides which tools to call ---
     print("\n>>> Step 1: Asking LLM (with tools bound)...\n")
-    response = await llm_with_tools.ainvoke(messages)
+    try:
+        response = await invoke_with_retry(llm_with_tools, messages)
+    except Exception as exc:
+        print(f">>> LLM unavailable after retry: {exc}\n")
+        print(fallback_answer(QUESTION))
+        return
     messages.append(response)
 
     if not response.tool_calls:
@@ -195,8 +264,12 @@ async def main():
 
     # --- Step 3: LLM generates final grounded answer ---
     print(">>> Step 3: LLM generating final answer with tool results...\n")
-    final_response = await llm_with_tools.ainvoke(messages)
-    print(final_response.content)
+    try:
+        final_response = await invoke_with_retry(llm_with_tools, messages)
+        print(final_response.content or "\n".join(msg.content for msg in messages if msg.type == "tool"))
+    except Exception as exc:
+        print(f">>> Final LLM call failed: {exc}\n")
+        print("\n".join(msg.content for msg in messages if msg.type == "tool"))
 
     print()
     print("-" * 70)

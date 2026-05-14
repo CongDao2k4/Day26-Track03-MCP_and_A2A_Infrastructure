@@ -3,3 +3,9 @@
 **cache**
 .claude
 **SOLUTION**
+uv.lock
+log*
+*.log
+*.tmp
+*.bak
+*.swp
